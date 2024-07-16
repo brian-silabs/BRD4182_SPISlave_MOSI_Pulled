@@ -26,31 +26,23 @@
 #include "em_prs.h"
 
 // SPI ports and pins
-#define US0MISO_PORT  gpioPortC
-#define US0MISO_PIN   1
-#define US0MOSI_PORT  gpioPortC
-#define US0MOSI_PIN   0
-#define US0CLK_PORT   gpioPortC
-#define US0CLK_PIN    2
-#define US0CS_PORT    gpioPortC
-#define US0CS_PIN     3
+#define US0MISO_PORT                  gpioPortC //EXP 6
+#define US0MISO_PIN                   1
+#define US0MOSI_PORT                  gpioPortC //EXP 4
+#define US0MOSI_PIN                   0
+#define US0CLK_PORT                   gpioPortC //EXP 8
+#define US0CLK_PIN                    2
+#define US0CS_PORT                    gpioPortC //EXP 10
+#define US0CS_PIN                     3
 
-/*
- * The TIMEPORT/TIMEPIN is not part of the SPI bus.  It shows when the
- * CPU responds to the main before, during, and after data transfer.
- * Use a logic analyzer to capture the activity on this pin along with
- * the bus traffic to understand the timing relationship between the
- * CPU and the SPI during interrupt-driven transfers.
- */
-#define TIMEPORT      gpioPortD
-#define TIMEPIN       2
+#define US0MISO_EXT_PORT              gpioPortD //EXP 11 - Pulled Down MISO
+#define US0MISO_EXT_PIN               2
 
-#define PRS_CHANNEL_MISO_INTERNAL       0
-#define PRS_CHANNEL_MISO_OUTPUT         1
-#define PRS_CHANNEL_CS_INTERNAL         2
+#define PRS_CHANNEL_MISO_INTERNAL     6
+#define PRS_CHANNEL_CS                7
 
 // Size of the data buffers
-#define BUFLEN  10
+#define BUFLEN                        10
 
 // Outgoing data
 uint8_t outbuf[BUFLEN];
@@ -95,8 +87,6 @@ void initGPIO(void)
   NVIC_EnableIRQ(GPIO_EVEN_IRQn);
 #endif
 
-  // Enable the activity pin
-  GPIO_PinModeSet(TIMEPORT, TIMEPIN, gpioModePushPull, 0);
 }
 
 /**************************************************************************//**
@@ -118,10 +108,10 @@ void initUSART0(void)
   USART_InitSync(USART0, &init);
 
   // Route USART0 RX, TX, CLK, and CS to the specified pins.
-  GPIO->USARTROUTE[0].RXROUTE = (US0MISO_PORT << _GPIO_USART_RXROUTE_PORT_SHIFT)
+  GPIO->USARTROUTE[0].RXROUTE = (US0MISO_PORT << _GPIO_USART_RXROUTE_PORT_SHIFT)// TX Whne slave
       | (US0MISO_PIN << _GPIO_USART_RXROUTE_PIN_SHIFT);
 
-  GPIO->USARTROUTE[0].TXROUTE = (US0MOSI_PORT << _GPIO_USART_TXROUTE_PORT_SHIFT)
+  GPIO->USARTROUTE[0].TXROUTE = (US0MOSI_PORT << _GPIO_USART_TXROUTE_PORT_SHIFT)// RX when slave
       | (US0MOSI_PIN << _GPIO_USART_TXROUTE_PIN_SHIFT);
 
   GPIO->USARTROUTE[0].CLKROUTE = (US0CLK_PORT << _GPIO_USART_CLKROUTE_PORT_SHIFT)
@@ -130,8 +120,8 @@ void initUSART0(void)
       | (US0CS_PIN << _GPIO_USART_CSROUTE_PIN_SHIFT);
 
   // Enable USART interface pins
-  GPIO->USARTROUTE[0].ROUTEEN = GPIO_USART_ROUTEEN_RXPEN  |    // MOSI
-                                GPIO_USART_ROUTEEN_TXPEN  |    // MISO
+  GPIO->USARTROUTE[0].ROUTEEN = GPIO_USART_ROUTEEN_RXPEN  |
+                                GPIO_USART_ROUTEEN_TXPEN  |
                                 GPIO_USART_ROUTEEN_CLKPEN |
                                 GPIO_USART_ROUTEEN_CSPEN;
 
@@ -142,12 +132,31 @@ void initUSART0(void)
   // Enable receive data valid interrupt
   USART_IntClear(USART0, USART_IF_RXDATAV);
   USART_IntEnable(USART0, USART_IEN_RXDATAV);
-  USART_Enable(USART0, usartEnable);
 }
 
-//void initPRS(void) {
-//  PRS_PinOutput(ch, type, port, pin)
-//}
+/**************************************************************************//**
+ * @brief
+ *    PRS initialization
+ *****************************************************************************/
+void initPRS(void)
+{
+  // Enable PRS clock
+  CMU_ClockEnable(cmuClock_PRS, true);
+
+  // Enable the activity pin
+  GPIO_PinModeSet(US0MISO_EXT_PORT, US0MISO_EXT_PIN, gpioModePushPull, 0);
+
+  //Configure USART0 MISO as source for PRS out, must configure edge detection
+  GPIO_ExtIntConfig(US0MISO_PORT, US0MISO_PIN, US0MISO_PIN, 0, 0, false);
+  PRS_SourceAsyncSignalSet(PRS_CHANNEL_MISO_INTERNAL, PRS_ASYNC_CH_CTRL_SOURCESEL_GPIO, US0MISO_PIN);
+
+  //Allocate second channel for CS combination
+  PRS_SourceAsyncSignalSet(PRS_CHANNEL_CS, PRS_ASYNC_CH_CTRL_SOURCESEL_USART0, prsSignalUSART0_CS);
+
+  //Combine channels and output
+  PRS_Combine(PRS_CHANNEL_CS, PRS_CHANNEL_MISO_INTERNAL, prsLogic_NOT_A_AND_B);
+  PRS_PinOutput(PRS_CHANNEL_CS, prsTypeAsync, US0MISO_EXT_PORT , US0MISO_EXT_PIN);
+}
 
 /**************************************************************************//**
  * @brief GPIO IRQHandler
@@ -168,9 +177,6 @@ void GPIO_EVEN_IRQHandler(void)
  *****************************************************************************/
 void USART0_RX_IRQHandler(void)
 {
-  // Drive the activity pin high to denote IRQ handler entry
-  GPIO->P_SET[TIMEPORT].DOUT = 1 << TIMEPIN;
-
   /*
    * Save the byte received concurrent with the transmission of the
    * last bit of the previous outgoing byte, and increment the buffer
@@ -185,9 +191,6 @@ void USART0_RX_IRQHandler(void)
   } else {
     bufpos = 0;
   }
-
-  // Drive the activity pin low to denote IRQ handler exit
-  GPIO->P_CLR[TIMEPORT].DOUT = 1 << TIMEPIN;
 }
 
 /***************************************************************************//**
@@ -210,12 +213,8 @@ void app_init(void)
     }
 
   initUSART0();
-  // Drive the activity pin high to denote IRQ handler entry
-  GPIO->P_SET[TIMEPORT].DOUT = 1 << TIMEPIN;
-
-  // Enable the falling edge interrupt on the US0CS_PIN
-//  GPIO_IntClear(1 << US0CS_PIN);
-//  GPIO_IntEnable(1 << US0CS_PIN);
+  initPRS();
+  USART_Enable(USART0, usartEnable);
 }
 
 /***************************************************************************//**
@@ -223,55 +222,4 @@ void app_init(void)
  ******************************************************************************/
 void app_process_action(void)
 {
-
-//
-//  // Start at the beginning of the buffer
-//  bufpos = 0;
-//
-//  // Enable the falling edge interrupt on the US0CS_PIN
-//  GPIO_IntClear(1 << US0CS_PIN);
-//  GPIO_IntEnable(1 << US0CS_PIN);
-//
-//  // Drive the activity pin low when ready for CS assertion
-//  GPIO->P_CLR[TIMEPORT].DOUT = 1 << TIMEPIN;
-//
-//  // Wait for falling edge on US0CS_PIN
-//  EMU_EnterEM1();
-//
-//  /*
-//   * Drive the activity pin high on wake from EM1 immediately after
-//   * CS assertion
-//   */
-//  GPIO->P_SET[TIMEPORT].DOUT = 1 << TIMEPIN;
-//
-//  // Now enable the USART receiver and transmitter
-//  USART_Enable(USART0, usartEnable);
-//
-//  // Enable receive data valid interrupt
-//  USART_IntEnable(USART0, USART_IEN_RXDATAV);
-//
-//  /*
-//   * Transmit the first byte, then go into EM1.  The IRQ handler will
-//   * receive each incoming byte and transmit the next outgoing byte.
-//   */
-//  USART0->TXDATA = outbuf[bufpos];
-//
-//  // Drive the activity pin low when ready to receive data
-//  GPIO->P_CLR[TIMEPORT].DOUT = 1 << TIMEPIN;
-//
-//  // Wait in EM1 until all data is received
-//  while (bufpos < BUFLEN)
-//    EMU_EnterEM1();
-//
-//  // Drive the activity pin high to show prep for next data transfer
-//  GPIO->P_SET[TIMEPORT].DOUT = 1 << TIMEPIN;
-//
-//  // Disable receive data interrupt
-//  USART_IntDisable(USART0, USART_IEN_RXDATAV);
-//
-//  // Disable the falling edge interrupt on the US0CS_PIN
-//  GPIO_IntDisable(1 << US0CS_PIN);
-//
-//  // Disable USART receiver and transmitter until next chip select
-//  USART_Enable(USART0, usartDisable);
 }
